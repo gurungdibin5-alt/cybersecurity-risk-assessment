@@ -9,9 +9,9 @@ pipeline {
         TRIVY_SEVERITY = 'CRITICAL,HIGH,MEDIUM'
         ZAP_TIMEOUT = '10'
         SCAN_NETWORK = 'security-scan-net'
-        MAX_CRITICAL_VULNS = '0'
-        MAX_HIGH_VULNS = '5'
-        MAX_MEDIUM_VULNS = '20'
+        MAX_CRITICAL_VULNS = 0
+        MAX_HIGH_VULNS = 5
+        MAX_MEDIUM_VULNS = 20
     }
     
     options {
@@ -45,12 +45,12 @@ pipeline {
                     script {
                         env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
                         env.GIT_AUTHOR = sh(script: 'git show -s --format="%an" HEAD', returnStdout: true).trim()
+                        echo "Checked out commit ${env.GIT_COMMIT_SHORT} by ${env.GIT_AUTHOR}"
                     }
                 }
             }
         }
 
-        // Wrap all subsequent stages that run shell commands with ansiColor
         stage('Docker Setup') {
             steps {
                 ansiColor('xterm') {
@@ -58,9 +58,15 @@ pipeline {
                         sh 'docker --version'
                         sh 'docker info'
                         sh "docker network create ${SCAN_NETWORK} --driver bridge --subnet=172.20.0.0/16 || true"
-                        
-                        def images = [JUICE_IMAGE, 'aquasec/trivy:latest', 'anchore/syft:latest', 
-                                      'owasp/zap2docker-stable:latest', 'instrumenta/nmap:latest', 'owasp/dependency-check:latest']
+
+                        def images = [
+                            JUICE_IMAGE,
+                            'aquasec/trivy:latest',
+                            'anchore/syft:latest',
+                            'owasp/zap2docker-stable:latest',
+                            'instrumenta/nmap:latest',
+                            'owasp/dependency-check:latest'
+                        ]
                         images.each { img -> retry(3) { sh "docker pull ${img}" } }
                     }
                 }
@@ -85,17 +91,101 @@ pipeline {
             }
         }
 
-        // Repeat the same pattern for all other stages where shell commands are used:
-        // Static Analysis, Container Scan, Network Scan, DAST, Security Gate
+        stage('Static Analysis') {
+            steps {
+                ansiColor('xterm') {
+                    script {
+                        echo "🔍 Running Dependency-Check (Static Analysis)"
+                        sh """
+                            docker run --rm -v ${WORKSPACE_DIR}:/src -v ${WORKSPACE_DIR}/${REPORT_DIR}/dependency-check:/report owasp/dependency-check:latest \
+                                --scan /src --format ALL --out /report
+                        """
+                    }
+                }
+            }
+        }
 
+        stage('Container Scan & SBOM') {
+            steps {
+                ansiColor('xterm') {
+                    script {
+                        echo "🛡️ Running Trivy for Vulnerabilities"
+                        sh """
+                            docker run --rm -v ${WORKSPACE_DIR}/${REPORT_DIR}/trivy:/report aquasec/trivy:latest image --severity ${TRIVY_SEVERITY} --format json --output /report/trivy.json ${JUICE_IMAGE}
+                        """
+                        echo "📦 Generating SBOM with Syft"
+                        sh """
+                            docker run --rm -v ${WORKSPACE_DIR}/${REPORT_DIR}/sbom:/sbom anchore/syft:latest ${JUICE_IMAGE} -o json > ${WORKSPACE_DIR}/${REPORT_DIR}/sbom/sbom.json
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Network Scan') {
+            steps {
+                ansiColor('xterm') {
+                    script {
+                        echo "🌐 Running Nmap network scan"
+                        sh """
+                            docker run --rm --network ${SCAN_NETWORK} instrumenta/nmap:latest -p 3000 ${APP_NAME} -oX /tmp/nmap.xml
+                            mv /tmp/nmap.xml ${WORKSPACE_DIR}/${REPORT_DIR}/nmap/nmap.xml
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('DAST') {
+            steps {
+                ansiColor('xterm') {
+                    script {
+                        echo "💻 Running OWASP ZAP Dynamic Analysis"
+                        sh """
+                            docker run --rm -v ${WORKSPACE_DIR}/${REPORT_DIR}/zap:/zap/wrk/:rw -t owasp/zap2docker-stable zap-baseline.py -t http://${APP_NAME}:3000 -r zap_report.html -z "-config api.disablekey=true" -d -T ${ZAP_TIMEOUT}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Security Gate') {
+            steps {
+                ansiColor('xterm') {
+                    script {
+                        echo "🚦 Checking vulnerability thresholds (Trivy JSON)"
+                        def trivyReport = readJSON file: "${REPORT_DIR}/trivy/trivy.json"
+                        def critical = trivyReport.Results.collectMany{ it.Vulnerabilities ?: [] }.count { it.Severity == 'CRITICAL' }
+                        def high = trivyReport.Results.collectMany{ it.Vulnerabilities ?: [] }.count { it.Severity == 'HIGH' }
+                        def medium = trivyReport.Results.collectMany{ it.Vulnerabilities ?: [] }.count { it.Severity == 'MEDIUM' }
+
+                        echo "Critical: ${critical}, High: ${high}, Medium: ${medium}"
+
+                        if (critical > MAX_CRITICAL_VULNS || high > MAX_HIGH_VULNS || medium > MAX_MEDIUM_VULNS) {
+                            error("❌ Vulnerability threshold exceeded! Failing the build.")
+                        } else {
+                            echo "✅ Vulnerability thresholds are within limits."
+                        }
+                    }
+                }
+            }
+        }
     }
-    
+
     post {
         always {
             ansiColor('xterm') {
                 archiveArtifacts artifacts: "${REPORT_DIR}/**/*", fingerprint: true, allowEmptyArchive: true
                 sh "docker rm -f ${APP_NAME} || true; docker network rm ${SCAN_NETWORK} || true"
             }
+        }
+
+        failure {
+            echo "❌ Pipeline failed!"
+        }
+
+        success {
+            echo "✅ Pipeline completed successfully!"
         }
     }
 }
