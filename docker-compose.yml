@@ -1,5 +1,3 @@
-### docker-compose.yml
-```yaml
 version: '3.8'
 
 services:
@@ -10,13 +8,13 @@ services:
     ports:
       - "8080:8080"
       - "50000:50000"
-    volumes:
-      - jenkins_home:/var/jenkins_home
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./jenkins:/var/jenkins_home/workspace/security-pipeline
+    user: root  # ensures Jenkins can access docker.sock
     environment:
       - DOCKER_HOST=unix:///var/run/docker.sock
-    user: root
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock  # needed for Jenkins to use Docker
+      - ./jenkins:/var/jenkins_home/workspace/security-pipeline
     networks:
       - security-network
 
