@@ -8,16 +8,15 @@ services:
     ports:
       - "8080:8080"
       - "50000:50000"
-    user: root  # ensures Jenkins can access docker.sock
+    user: root
     environment:
       - DOCKER_HOST=tcp://host.docker.internal:2375
-
     volumes:
       - jenkins_home:/var/jenkins_home
-      - /var/run/docker.sock:/var/run/docker.sock  # needed for Jenkins to use Docker
       - ./jenkins:/var/jenkins_home/workspace/security-pipeline
     networks:
       - security-network
+
 
   portainer:
     image: portainer/portainer-ce:latest
@@ -38,5 +37,6 @@ volumes:
 networks:
   security-network:
     driver: bridge
+
 
 
