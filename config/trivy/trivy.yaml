@@ -1,0 +1,15 @@
+# Trivy Configuration File
+format: json
+exit-code: 1
+severity: CRITICAL,HIGH,MEDIUM
+scanners:
+  - vuln
+  - secret
+  - config
+vulnerability:
+  type: os,library
+secret:
+  config: .trivyignore
+cache:
+  dir: /tmp/trivy-cache
+timeout: 10m
