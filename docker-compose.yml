@@ -10,7 +10,8 @@ services:
       - "50000:50000"
     user: root  # ensures Jenkins can access docker.sock
     environment:
-      - DOCKER_HOST=unix:///var/run/docker.sock
+      - DOCKER_HOST=tcp://host.docker.internal:2375
+
     volumes:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock  # needed for Jenkins to use Docker
@@ -37,4 +38,5 @@ volumes:
 networks:
   security-network:
     driver: bridge
+
 
