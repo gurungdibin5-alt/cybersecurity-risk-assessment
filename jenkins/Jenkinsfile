@@ -1,0 +1,558 @@
+pipeline {
+    agent any
+    
+    environment {
+        // Application Configuration
+        APP_NAME = 'juice-shop'
+        JUICE_IMAGE = 'bkimminich/juice-shop:latest'
+        
+        // Directory Configuration
+        REPORT_DIR = 'reports'
+        WORKSPACE_DIR = "${WORKSPACE}"
+        
+        // Security Tool Configuration
+        TRIVY_SEVERITY = 'CRITICAL,HIGH,MEDIUM'
+        TRIVY_FORMAT = 'json'
+        ZAP_TIMEOUT = '10'
+        NMAP_TARGETS = 'juice:3000'
+        
+        // Docker Network
+        SCAN_NETWORK = 'security-scan-net'
+        
+        // Vulnerability Thresholds
+        MAX_CRITICAL_VULNS = '0'
+        MAX_HIGH_VULNS = '5'
+        MAX_MEDIUM_VULNS = '20'
+    }
+    
+    options {
+        timestamps()
+        ansiColor('xterm')
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '5'
+        ))
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    echo "🚀 Starting Automated Cybersecurity Risk Assessment"
+                    echo "Project: ${env.JOB_NAME}"
+                    echo "Build: ${env.BUILD_NUMBER}"
+                    echo "Workspace: ${env.WORKSPACE}"
+                    
+                    // Create necessary directories
+                    sh '''
+                        mkdir -p ${REPORT_DIR}/{trivy,zap,nmap,dependency-check,sbom,aggregated}
+                        mkdir -p temp/source-code
+                        chmod 755 ${REPORT_DIR}
+                    '''
+                    
+                    // Clean up any existing containers/networks
+                    sh '''
+                        docker rm -f ${APP_NAME} || true
+                        docker network rm ${SCAN_NETWORK} || true
+                        docker system prune -f --volumes || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Source Code Checkout') {
+            steps {
+                checkout scm
+                script {
+                    // Get commit information for reporting
+                    env.GIT_COMMIT_SHORT = sh(
+                        returnStdout: true,
+                        script: 'git rev-parse --short HEAD'
+                    ).trim()
+                    
+                    env.GIT_AUTHOR = sh(
+                        returnStdout: true,
+                        script: 'git show -s --format="%an" HEAD'
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Docker Environment Setup') {
+            steps {
+                script {
+                    echo "🐳 Setting up Docker environment..."
+                    
+                    // Verify Docker access
+                    sh 'docker --version'
+                    sh 'docker info'
+                    
+                    // Create isolated network for security scanning
+                    sh """
+                        docker network create ${SCAN_NETWORK} --driver bridge --subnet=172.20.0.0/16 || true
+                    """
+                    
+                    // Pull required security scanner images
+                    def securityImages = [
+                        "${JUICE_IMAGE}",
+                        "aquasec/trivy:latest",
+                        "anchore/syft:latest", 
+                        "owasp/zap2docker-stable:latest",
+                        "instrumenta/nmap:latest",
+                        "owasp/dependency-check:latest"
+                    ]
+                    
+                    securityImages.each { image ->
+                        retry(3) {
+                            sh """
+                                echo "Pulling ${image}..."
+                                docker pull ${image}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy Target Application') {
+            steps {
+                script {
+                    echo "🎯 Deploying target application for security testing..."
+                    
+                    sh """
+                        docker run -d \
+                            --name ${APP_NAME} \
+                            --network ${SCAN_NETWORK} \
+                            --ip 172.20.0.10 \
+                            -p 3000:3000 \
+                            ${JUICE_IMAGE}
+                    """
+                    
+                    // Wait for application to be ready
+                    sh '''
+                        echo "⏳ Waiting for application to start..."
+                        for i in {1..60}; do
+                            if docker exec juice-shop wget --quiet --tries=1 --spider http://localhost:3000/ 2>/dev/null; then
+                                echo "✅ Application is ready!"
+                                break
+                            fi
+                            echo "Waiting... ($i/60)"
+                            sleep 5
+                        done
+                        
+                        if [ $i -eq 60 ]; then
+                            echo "❌ Application failed to start within timeout"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('Static Analysis - Source Code') {
+            parallel {
+                stage('OWASP Dependency Check') {
+                    steps {
+                        script {
+                            echo "🔍 Running OWASP Dependency Check..."
+                            
+                            sh """
+                                docker run --rm \
+                                    -v "${WORKSPACE}":/src \
+                                    -v "${WORKSPACE}/${REPORT_DIR}/dependency-check":/report \
+                                    owasp/dependency-check:latest \
+                                    --scan /src \
+                                    --out /report \
+                                    --format JSON \
+                                    --format HTML \
+                                    --project "${APP_NAME}" \
+                                    --enableRetired \
+                                    --enableExperimental \
+                                    --nvdMaxRetryCount 3
+                            """
+                        }
+                    }
+                    post {
+                        always {
+                            script {
+                                if (fileExists("${REPORT_DIR}/dependency-check/dependency-check-report.html")) {
+                                    publishHTML([
+                                        allowMissing: false,
+                                        alwaysLinkToLastBuild: true,
+                                        keepAll: true,
+                                        reportDir: "${REPORT_DIR}/dependency-check",
+                                        reportFiles: 'dependency-check-report.html',
+                                        reportName: 'OWASP Dependency Check Report'
+                                    ])
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                stage('Container SBOM Generation') {
+                    steps {
+                        script {
+                            echo "📋 Generating Software Bill of Materials (SBOM)..."
+                            
+                            sh """
+                                docker run --rm \
+                                    -v "${WORKSPACE}/${REPORT_DIR}/sbom":/work \
+                                    anchore/syft:latest \
+                                    packages ${JUICE_IMAGE} \
+                                    -o json=/work/sbom.json \
+                                    -o spdx-json=/work/sbom-spdx.json \
+                                    -o cyclonedx-json=/work/sbom-cyclonedx.json
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Container Security Scanning') {
+            steps {
+                script {
+                    echo "🛡️ Running container vulnerability scan with Trivy..."
+                    
+                    // Create or use existing Trivy cache
+                    sh 'docker volume create trivy-cache || true'
+                    
+                    def trivyExitCode = sh(
+                        returnStatus: true,
+                        script: """
+                            docker run --rm \
+                                -v "${WORKSPACE}/${REPORT_DIR}/trivy":/work \
+                                -v trivy-cache:/root/.cache/ \
+                                aquasec/trivy:latest image \
+                                --scanners vuln,secret,config \
+                                --severity ${TRIVY_SEVERITY} \
+                                --format json \
+                                --output /work/trivy-report.json \
+                                --exit-code 1 \
+                                ${JUICE_IMAGE}
+                        """
+                    )
+                    
+                    // Generate HTML report
+                    sh """
+                        docker run --rm \
+                            -v "${WORKSPACE}/${REPORT_DIR}/trivy":/work \
+                            -v trivy-cache:/root/.cache/ \
+                            aquasec/trivy:latest image \
+                            --scanners vuln,secret,config \
+                            --severity ${TRIVY_SEVERITY} \
+                            --format template \
+                            --template '@contrib/html.tpl' \
+                            --output /work/trivy-report.html \
+                            ${JUICE_IMAGE}
+                    """
+                    
+                    // Process results
+                    if (trivyExitCode == 1) {
+                        currentBuild.result = 'UNSTABLE'
+                        echo "⚠️ Trivy found vulnerabilities in container image"
+                    }
+                }
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: "${REPORT_DIR}/trivy",
+                        reportFiles: 'trivy-report.html',
+                        reportName: 'Trivy Container Security Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Network Security Scanning') {
+            steps {
+                script {
+                    echo "🌐 Running network security scan with Nmap..."
+                    
+                    sh """
+                        docker run --rm \
+                            --network ${SCAN_NETWORK} \
+                            -v "${WORKSPACE}/${REPORT_DIR}/nmap":/work \
+                            instrumenta/nmap:latest \
+                            nmap -sS -sV -sC -A -O -T4 \
+                            --script vuln,exploit,malware \
+                            -oA /work/nmap-scan \
+                            -oX /work/nmap-report.xml \
+                            172.20.0.10
+                    """
+                    
+                    // Convert to HTML for better viewing
+                    sh """
+                        docker run --rm \
+                            -v "${WORKSPACE}/${REPORT_DIR}/nmap":/work \
+                            instrumenta/nmap:latest \
+                            bash -c 'xsltproc /usr/share/nmap/nmap.xsl /work/nmap-report.xml > /work/nmap-report.html'
+                    """
+                }
+            }
+            post {
+                always {
+                    script {
+                        if (fileExists("${REPORT_DIR}/nmap/nmap-report.html")) {
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: "${REPORT_DIR}/nmap",
+                                reportFiles: 'nmap-report.html',
+                                reportName: 'Nmap Network Security Report'
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Dynamic Application Security Testing (DAST)') {
+            parallel {
+                stage('OWASP ZAP Baseline Scan') {
+                    steps {
+                        script {
+                            echo "⚡ Running OWASP ZAP baseline scan..."
+                            
+                            def zapExitCode = sh(
+                                returnStatus: true,
+                                script: """
+                                    docker run --rm \
+                                        --network ${SCAN_NETWORK} \
+                                        -v "${WORKSPACE}/${REPORT_DIR}/zap":/zap/wrk:rw \
+                                        owasp/zap2docker-stable:latest \
+                                        zap-baseline.py \
+                                        -t http://172.20.0.10:3000 \
+                                        -r zap-baseline-report.html \
+                                        -J zap-baseline-report.json \
+                                        -x zap-baseline-report.xml \
+                                        -m ${ZAP_TIMEOUT} \
+                                        -a
+                                """
+                            )
+                            
+                            if (zapExitCode != 0) {
+                                currentBuild.result = 'UNSTABLE'
+                                echo "⚠️ ZAP baseline scan found security issues"
+                            }
+                        }
+                    }
+                }
+                
+                stage('OWASP ZAP Full Scan') {
+                    steps {
+                        script {
+                            echo "🔥 Running OWASP ZAP full scan..."
+                            
+                            timeout(time: 30, unit: 'MINUTES') {
+                                def zapFullExitCode = sh(
+                                    returnStatus: true,
+                                    script: """
+                                        docker run --rm \
+                                            --network ${SCAN_NETWORK} \
+                                            -v "${WORKSPACE}/${REPORT_DIR}/zap":/zap/wrk:rw \
+                                            owasp/zap2docker-stable:latest \
+                                            zap-full-scan.py \
+                                            -t http://172.20.0.10:3000 \
+                                            -r zap-full-report.html \
+                                            -J zap-full-report.json \
+                                            -x zap-full-report.xml \
+                                            -m ${ZAP_TIMEOUT}
+                                    """
+                                )
+                                
+                                if (zapFullExitCode != 0) {
+                                    currentBuild.result = 'UNSTABLE'
+                                    echo "⚠️ ZAP full scan found security vulnerabilities"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    script {
+                        // Publish ZAP reports
+                        if (fileExists("${REPORT_DIR}/zap/zap-baseline-report.html")) {
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: "${REPORT_DIR}/zap",
+                                reportFiles: 'zap-baseline-report.html',
+                                reportName: 'OWASP ZAP Baseline Report'
+                            ])
+                        }
+                        
+                        if (fileExists("${REPORT_DIR}/zap/zap-full-report.html")) {
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: "${REPORT_DIR}/zap",
+                                reportFiles: 'zap-full-report.html',
+                                reportName: 'OWASP ZAP Full Scan Report'
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Risk Assessment & Report Generation') {
+            steps {
+                script {
+                    echo "📊 Generating comprehensive security risk assessment..."
+                    
+                    // Create aggregated security report
+                    sh """
+                        docker run --rm \
+                            -v "${WORKSPACE}/${REPORT_DIR}":/reports \
+                            -v "${WORKSPACE}/jenkins/scripts":/scripts \
+                            python:3.9-slim \
+                            bash -c '
+                                cd /scripts && \
+                                pip install --no-cache-dir jinja2 lxml beautifulsoup4 && \
+                                python generate-security-report.py /reports
+                            '
+                    """
+                }
+            }
+        }
+        
+        stage('Security Gate') {
+            steps {
+                script {
+                    echo "🚪 Evaluating security gate criteria..."
+                    
+                    // Parse Trivy results for vulnerability count
+                    def trivyResults = readJSON file: "${REPORT_DIR}/trivy/trivy-report.json"
+                    def criticalCount = 0
+                    def highCount = 0
+                    def mediumCount = 0
+                    
+                    if (trivyResults.Results) {
+                        trivyResults.Results.each { result ->
+                            result.Vulnerabilities?.each { vuln ->
+                                switch(vuln.Severity) {
+                                    case 'CRITICAL':
+                                        criticalCount++
+                                        break
+                                    case 'HIGH':
+                                        highCount++
+                                        break
+                                    case 'MEDIUM':
+                                        mediumCount++
+                                        break
+                                }
+                            }
+                        }
+                    }
+                    
+                    echo "📈 Vulnerability Summary:"
+                    echo "   Critical: ${criticalCount} (Threshold: ${MAX_CRITICAL_VULNS})"
+                    echo "   High: ${highCount} (Threshold: ${MAX_HIGH_VULNS})"
+                    echo "   Medium: ${mediumCount} (Threshold: ${MAX_MEDIUM_VULNS})"
+                    
+                    // Evaluate security gates
+                    def gatesPassed = true
+                    def gateFailures = []
+                    
+                    if (criticalCount > Integer.parseInt(MAX_CRITICAL_VULNS)) {
+                        gatesPassed = false
+                        gateFailures.add("Critical vulnerabilities: ${criticalCount} > ${MAX_CRITICAL_VULNS}")
+                    }
+                    
+                    if (highCount > Integer.parseInt(MAX_HIGH_VULNS)) {
+                        gatesPassed = false
+                        gateFailures.add("High vulnerabilities: ${highCount} > ${MAX_HIGH_VULNS}")
+                    }
+                    
+                    if (mediumCount > Integer.parseInt(MAX_MEDIUM_VULNS)) {
+                        gatesPassed = false
+                        gateFailures.add("Medium vulnerabilities: ${mediumCount} > ${MAX_MEDIUM_VULNS}")
+                    }
+                    
+                    if (!gatesPassed) {
+                        currentBuild.result = 'FAILURE'
+                        error("🚫 Security gates failed:\n" + gateFailures.join('\n'))
+                    } else {
+                        echo "✅ All security gates passed!"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "🧹 Performing cleanup..."
+                
+                // Archive all reports
+                archiveArtifacts artifacts: "${REPORT_DIR}/**/*", 
+                              fingerprint: true, 
+                              allowEmptyArchive: true
+                
+                // Cleanup containers and networks
+                sh """
+                    docker rm -f ${APP_NAME} || true
+                    docker network rm ${SCAN_NETWORK} || true
+                """
+            }
+        }
+        
+        success {
+            echo "✅ Security assessment completed successfully!"
+            
+            // Send success notification
+            script {
+                if (env.SLACK_WEBHOOK) {
+                    sh """
+                        curl -X POST -H 'Content-type: application/json' \
+                        --data '{"text":"✅ Security scan passed for ${env.JOB_NAME} #${env.BUILD_NUMBER}"}' \
+                        ${env.SLACK_WEBHOOK}
+                    """
+                }
+            }
+        }
+        
+        failure {
+            echo "❌ Security assessment failed!"
+            
+            // Send failure notification  
+            script {
+                if (env.SLACK_WEBHOOK) {
+                    sh """
+                        curl -X POST -H 'Content-type: application/json' \
+                        --data '{"text":"❌ Security scan failed for ${env.JOB_NAME} #${env.BUILD_NUMBER}"}' \
+                        ${env.SLACK_WEBHOOK}
+                    """
+                }
+            }
+        }
+        
+        unstable {
+            echo "⚠️ Security assessment completed with warnings!"
+            
+            // Send warning notification
+            script {
+                if (env.SLACK_WEBHOOK) {
+                    sh """
+                        curl -X POST -H 'Content-type: application/json' \
+                        --data '{"text":"⚠️ Security scan completed with warnings for ${env.JOB_NAME} #${env.BUILD_NUMBER}"}' \
+                        ${env.SLACK_WEBHOOK}
+                    """
+                }
+            }
+        }
+    }
+}
