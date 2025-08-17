@@ -1,4 +1,4 @@
-
+version: '3.8'
 
 services:
   jenkins:
@@ -10,13 +10,13 @@ services:
       - "50000:50000"
     user: root
     environment:
+      # Connect to Docker on Windows via TCP
       - DOCKER_HOST=tcp://host.docker.internal:2375
     volumes:
       - jenkins_home:/var/jenkins_home
       - ./jenkins:/var/jenkins_home/workspace/security-pipeline
     networks:
       - security-network
-
 
   portainer:
     image: portainer/portainer-ce:latest
@@ -25,7 +25,6 @@ services:
     ports:
       - "9000:9000"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
     networks:
       - security-network
@@ -37,6 +36,3 @@ volumes:
 networks:
   security-network:
     driver: bridge
-
-
-
