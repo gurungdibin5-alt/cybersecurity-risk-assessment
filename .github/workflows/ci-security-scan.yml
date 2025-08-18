@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM
 
+permissions:
+  contents: read
+  security-events: write   # 👈 Required for uploading SARIF scan results
+  actions: read
+
 jobs:
   security-scan:
     runs-on: ubuntu-latest
